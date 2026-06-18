@@ -305,8 +305,18 @@ class SingleRealsense(mp.Process):
 
             # report global time
             # https://github.com/IntelRealSense/librealsense/pull/3909
-            d = pipeline_profile.get_device().first_color_sensor()
-            d.set_option(rs.option.global_time_enabled, 1)
+            # first_color_sensor() fails on D405 — color stream is on Stereo Module.
+            # Iterate sensors to find the one owning the color stream.
+            _d = None
+            for _s in pipeline_profile.get_device().query_sensors():
+                for _sp in _s.get_stream_profiles():
+                    if _sp.stream_type() == rs.stream.color:
+                        _d = _s
+                        break
+                if _d is not None:
+                    break
+            if _d is not None:
+                _d.set_option(rs.option.global_time_enabled, 1)
 
             # setup advanced mode
             if self.advanced_mode_config is not None:
@@ -442,7 +452,14 @@ class SingleRealsense(mp.Process):
                         command[key] = value[i]
                     cmd = command['cmd']
                     if cmd == Command.SET_COLOR_OPTION.value:
-                        sensor = pipeline_profile.get_device().first_color_sensor()
+                        sensor = None
+                        for _s in pipeline_profile.get_device().query_sensors():
+                            for _sp in _s.get_stream_profiles():
+                                if _sp.stream_type() == rs.stream.color:
+                                    sensor = _s
+                                    break
+                            if sensor is not None:
+                                break
                         option = rs.option(command['option_enum'])
                         value = float(command['option_value'])
                         sensor.set_option(option, value)

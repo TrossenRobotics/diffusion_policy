@@ -5,7 +5,6 @@ import time
 import shutil
 import math
 from multiprocessing.managers import SharedMemoryManager
-from diffusion_policy.real_world.rtde_interpolation_controller import RTDEInterpolationController
 from diffusion_policy.real_world.multi_realsense import MultiRealsense, SingleRealsense
 from diffusion_policy.real_world.video_recorder import VideoRecorder
 from diffusion_policy.common.timestamp_accumulator import (
@@ -60,7 +59,9 @@ class RealEnv:
             enable_multi_cam_vis=True,
             multi_cam_vis_resolution=(1280,720),
             # shared memory
-            shm_manager=None
+            shm_manager=None,
+            # optional pre-built robot controller
+            robot=None
             ):
         assert frequency <= video_capture_fps
         output_dir = pathlib.Path(output_dir)
@@ -155,25 +156,27 @@ class RealEnv:
         if not init_joints:
             j_init = None
 
-        robot = RTDEInterpolationController(
-            shm_manager=shm_manager,
-            robot_ip=robot_ip,
-            frequency=125, # UR5 CB3 RTDE
-            lookahead_time=0.1,
-            gain=300,
-            max_pos_speed=max_pos_speed*cube_diag,
-            max_rot_speed=max_rot_speed*cube_diag,
-            launch_timeout=3,
-            tcp_offset_pose=[0,0,tcp_offset,0,0,0],
-            payload_mass=None,
-            payload_cog=None,
-            joints_init=j_init,
-            joints_init_speed=1.05,
-            soft_real_time=False,
-            verbose=False,
-            receive_keys=None,
-            get_max_k=max_obs_buffer_size
-            )
+        if robot is None:
+            from diffusion_policy.real_world.rtde_interpolation_controller import RTDEInterpolationController
+            robot = RTDEInterpolationController(
+                shm_manager=shm_manager,
+                robot_ip=robot_ip,
+                frequency=125, # UR5 CB3 RTDE
+                lookahead_time=0.1,
+                gain=300,
+                max_pos_speed=max_pos_speed*cube_diag,
+                max_rot_speed=max_rot_speed*cube_diag,
+                launch_timeout=3,
+                tcp_offset_pose=[0,0,tcp_offset,0,0,0],
+                payload_mass=None,
+                payload_cog=None,
+                joints_init=j_init,
+                joints_init_speed=1.05,
+                soft_real_time=False,
+                verbose=False,
+                receive_keys=None,
+                get_max_k=max_obs_buffer_size
+                )
         self.realsense = realsense
         self.robot = robot
         self.multi_cam_vis = multi_cam_vis
@@ -204,7 +207,9 @@ class RealEnv:
     
     def start(self, wait=True):
         self.realsense.start(wait=False)
-        self.robot.start(wait=False)
+        # only start the robot if it is not already running
+        if not self.robot.is_alive():
+            self.robot.start(wait=False)
         if self.multi_cam_vis is not None:
             self.multi_cam_vis.start(wait=False)
         if wait:

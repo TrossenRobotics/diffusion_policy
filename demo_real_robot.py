@@ -1,11 +1,9 @@
 """
 Usage:
-(robodiff)$ python demo_real_robot.py -o <demo_save_dir> --robot_ip <ip_of_ur5>
+python demo_real_robot.py -o <demo_save_dir> --follower_ip <ip> --leader_ip <ip>
 
 Robot movement:
-Move your SpaceMouse to move the robot EEF (locked in xy plane).
-Press SpaceMouse right button to unlock z axis.
-Press SpaceMouse left button to enable rotation axes.
+Move the leader arm - teleoperation.
 
 Recording control:
 Click the opencv window (make sure it's in focus).
@@ -21,9 +19,9 @@ from multiprocessing.managers import SharedMemoryManager
 import click
 import cv2
 import numpy as np
-import scipy.spatial.transform as st
 from diffusion_policy.real_world.real_env import RealEnv
-from diffusion_policy.real_world.spacemouse_shared_memory import Spacemouse
+from diffusion_policy.real_world.leader_arm_shared_memory import LeaderArm
+from diffusion_policy.real_world.trossen_arm_controller import TrossenArmController
 from diffusion_policy.common.precise_sleep import precise_wait
 from diffusion_policy.real_world.keystroke_counter import (
     KeystrokeCounter, Key, KeyCode
@@ -31,42 +29,59 @@ from diffusion_policy.real_world.keystroke_counter import (
 
 @click.command()
 @click.option('--output', '-o', required=True, help="Directory to save demonstration dataset.")
-@click.option('--robot_ip', '-ri', required=True, help="UR5's IP address e.g. 192.168.0.204")
+@click.option('--follower_ip', '-fi', required=True, help="Follower arm IP address e.g. 192.168.1.3")
+@click.option('--leader_ip', '-li', required=True, help="Leader arm IP address e.g. 192.168.1.2")
 @click.option('--vis_camera_idx', default=0, type=int, help="Which RealSense camera to visualize.")
-@click.option('--init_joints', '-j', is_flag=True, default=False, help="Whether to initialize robot joint configuration in the beginning.")
+@click.option('--init_joints', '-j', is_flag=True, default=False, help="Whether to initialize robots joint configuration in the beginning.")
 @click.option('--frequency', '-f', default=10, type=float, help="Control frequency in Hz.")
-@click.option('--command_latency', '-cl', default=0.01, type=float, help="Latency between receiving SapceMouse command to executing on Robot in Sec.")
-def main(output, robot_ip, vis_camera_idx, init_joints, frequency, command_latency):
+@click.option('--command_latency', '-cl', default=0.01, type=float, help="Latency between reading leader pose and executing on follower in Sec.")
+def main(output, follower_ip, leader_ip, vis_camera_idx, init_joints, frequency, command_latency):
     dt = 1/frequency
+    # home position — both arms start here before teleoperation
+    home_joints = np.array([0.0, np.pi/3, np.pi/6, np.pi/5, 0.0, 0.0, 0.0])
+    init_joints_pos = home_joints if init_joints else None
+
     with SharedMemoryManager() as shm_manager:
         with KeystrokeCounter() as key_counter, \
-            Spacemouse(shm_manager=shm_manager) as sm, \
+            LeaderArm(
+                shm_manager=shm_manager,
+                leader_ip=leader_ip,
+                frequency=100,
+                init_joints_pos=init_joints_pos,
+            ) as leader, \
+            TrossenArmController(
+                shm_manager=shm_manager,
+                follower_ip=follower_ip,
+                frequency=125,
+                init_joints_pos=init_joints_pos,
+            ) as robot, \
             RealEnv(
-                output_dir=output, 
-                robot_ip=robot_ip, 
+                output_dir=output,
+                robot_ip=follower_ip,  # unused when robot= is provided
                 # recording resolution
                 obs_image_resolution=(1280,720),
                 frequency=frequency,
-                init_joints=init_joints,
+                init_joints=init_joints, # unused when robot= is provided
                 enable_multi_cam_vis=True,
                 record_raw_video=True,
                 # number of threads per camera view for video recording (H.264)
                 thread_per_video=3,
                 # video recording quality, lower is better (but slower).
                 video_crf=21,
-                shm_manager=shm_manager
+                shm_manager=shm_manager,
+                robot=robot,
             ) as env:
             cv2.setNumThreads(1)
 
             # realsense exposure
-            env.realsense.set_exposure(exposure=120, gain=0)
+            env.realsense.set_exposure()
             # realsense white balance
-            env.realsense.set_white_balance(white_balance=5900)
+            env.realsense.set_white_balance()
 
             time.sleep(1.0)
             print('Ready!')
             state = env.get_robot_state()
-            target_pose = state['TargetTCPPose']
+            target_pose = np.array(state['ActualTCPPose'])
             t_start = time.monotonic()
             iter_idx = 0
             stop = False
@@ -127,25 +142,10 @@ def main(output, robot_ip, vis_camera_idx, init_joints, frequency, command_laten
                 cv2.pollKey()
 
                 precise_wait(t_sample)
-                # get teleop command
-                sm_state = sm.get_motion_state_transformed()
-                # print(sm_state)
-                dpos = sm_state[:3] * (env.max_pos_speed / frequency)
-                drot_xyz = sm_state[3:] * (env.max_rot_speed / frequency)
-                
-                if not sm.is_button_pressed(0):
-                    # translation mode
-                    drot_xyz[:] = 0
-                else:
-                    dpos[:] = 0
-                if not sm.is_button_pressed(1):
-                    # 2D translation mode
-                    dpos[2] = 0    
-
-                drot = st.Rotation.from_euler('xyz', drot_xyz)
-                target_pose[:3] += dpos
-                target_pose[3:] = (drot * st.Rotation.from_rotvec(
-                    target_pose[3:])).as_rotvec()
+                # get teleop command from leader arm
+                # leader pose is already absolute
+                leader_state = leader.get_state()
+                target_pose = np.array(leader_state['LeaderTCPPose'])
 
                 # execute teleop command
                 env.exec_actions(
