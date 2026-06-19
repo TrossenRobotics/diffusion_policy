@@ -4,6 +4,7 @@ import time
 import pathlib
 from multiprocessing.managers import SharedMemoryManager
 import numpy as np
+import cv2
 import pyrealsense2 as rs
 from diffusion_policy.real_world.single_realsense import SingleRealsense
 from diffusion_policy.real_world.video_recorder import VideoRecorder
@@ -34,6 +35,10 @@ class MultiRealsense:
         if serial_numbers is None:
             serial_numbers = SingleRealsense.get_connected_devices_serial()
         n_cameras = len(serial_numbers)
+
+        # IMPORTANT: force OpenCV to be single-threaded in the *parent* process
+        # before constructing the per-camera processes.
+        cv2.setNumThreads(1)
 
         advanced_mode_config = repeat_to_list(
             advanced_mode_config, n_cameras, dict)
