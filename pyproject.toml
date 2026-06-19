@@ -30,6 +30,7 @@ dependencies = [
     "pyrealsense2>=2.58.2.10647",
     "atomics>=1.0.3",
     "pynput>=1.8.2",
+    "sk-video>=1.1.10",
 ]
 
 # PyTorch CUDA 12.8 wheel index — use cu128 builds for CUDA 12.x systems

@@ -1,0 +1,45 @@
+name: real_image
+
+# C, H, W for each camera stream (recorded video is resized to this for training)
+image_shape: [3, 240, 320]
+
+# directory containing replay_buffer.zarr + videos/ recorded by demo_real_robot.py
+dataset_path: data/push_cube_real
+
+shape_meta: &shape_meta
+  # acceptable types: rgb, low_dim
+  obs:
+    # two RealSense D405 cameras. Keys are camera_<i> where i is the camera index
+    # (sorted serial order) used by demo_real_robot.py / RealEnv.
+    camera_0:
+      shape: ${task.image_shape}
+      type: rgb
+    camera_1:
+      shape: ${task.image_shape}
+      type: rgb
+    # Trossen follower end-effector pose: [x, y, z, rx, ry, rz] (6-DOF)
+    robot_eef_pose:
+      shape: [6]
+      type: low_dim
+  action:
+    # 6-DOF Cartesian action (leader EEF pose), matching robot_eef_pose
+    shape: [6]
+
+env_runner:
+  # no-op runner: real-robot evaluation is done separately via eval_real_robot.py
+  _target_: diffusion_policy.env_runner.real_pusht_image_runner.RealPushTImageRunner
+
+dataset:
+  _target_: diffusion_policy.dataset.real_pusht_image_dataset.RealPushTImageDataset
+  shape_meta: *shape_meta
+  dataset_path: ${task.dataset_path}
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  n_obs_steps: ${dataset_obs_steps}
+  n_latency_steps: ${n_latency_steps}
+  use_cache: True
+  seed: 42
+  val_ratio: 0.00
+  max_train_episodes: null
+  delta_action: False

@@ -1,12 +1,12 @@
 """
 Usage:
-(robodiff)$ python eval_real_robot.py -i <ckpt_path> -o <save_dir> --robot_ip <ip_of_ur5>
+uv run python eval_real_robot.py -i <ckpt_path> -o <save_dir> \
+    --follower_ip <follower_ip> --leader_ip <leader_ip>
 
 ================ Human in control ==============
 Robot movement:
-Move your SpaceMouse to move the robot EEF (locked in xy plane).
-Press SpaceMouse right button to unlock z axis.
-Press SpaceMouse left button to enable rotation axes.
+Move the LEADER arm to teleoperate the follower (the follower mirrors the
+leader's absolute 6-DOF pose, exactly like demo_real_robot.py).
 
 Recording control:
 Click the opencv window (make sure it's in focus).
@@ -32,9 +32,10 @@ import hydra
 import pathlib
 import skvideo.io
 from omegaconf import OmegaConf
-import scipy.spatial.transform as st
 from diffusion_policy.real_world.real_env import RealEnv
-from diffusion_policy.real_world.spacemouse_shared_memory import Spacemouse
+# Trossen teleop (leader) + follower controller replace the UR5 SpaceMouse setup.
+from diffusion_policy.real_world.leader_arm_shared_memory import LeaderArm
+from diffusion_policy.real_world.trossen_arm_controller import TrossenArmController
 from diffusion_policy.common.precise_sleep import precise_wait
 from diffusion_policy.real_world.real_inference_util import (
     get_real_obs_resolution, 
@@ -50,7 +51,8 @@ OmegaConf.register_new_resolver("eval", eval, replace=True)
 @click.command()
 @click.option('--input', '-i', required=True, help='Path to checkpoint')
 @click.option('--output', '-o', required=True, help='Directory to save recording')
-@click.option('--robot_ip', '-ri', required=True, help="UR5's IP address e.g. 192.168.0.204")
+@click.option('--follower_ip', '-fi', required=True, help="Follower arm IP, e.g. 192.168.1.4")
+@click.option('--leader_ip', '-li', required=True, help="Leader arm IP, e.g. 192.168.1.2")
 @click.option('--match_dataset', '-m', default=None, help='Dataset used to overlay and adjust initial condition')
 @click.option('--match_episode', '-me', default=None, type=int, help='Match specific episode from the match dataset')
 @click.option('--vis_camera_idx', default=0, type=int, help="Which RealSense camera to visualize.")
@@ -59,7 +61,7 @@ OmegaConf.register_new_resolver("eval", eval, replace=True)
 @click.option('--max_duration', '-md', default=60, help='Max duration for each epoch in seconds.')
 @click.option('--frequency', '-f', default=10, type=float, help="Control frequency in Hz.")
 @click.option('--command_latency', '-cl', default=0.01, type=float, help="Latency between receiving SapceMouse command to executing on Robot in Sec.")
-def main(input, output, robot_ip, match_dataset, match_episode,
+def main(input, output, follower_ip, leader_ip, match_dataset, match_episode,
     vis_camera_idx, init_joints, 
     steps_per_inference, max_duration,
     frequency, command_latency):
@@ -136,33 +138,54 @@ def main(input, output, robot_ip, match_dataset, match_episode,
 
     obs_res = get_real_obs_resolution(cfg.task.shape_meta)
     n_obs_steps = cfg.n_obs_steps
+    # action dimensionality the policy was trained with (6 for Trossen, 2 for sim pusht)
+    action_dim = cfg.task.shape_meta['action']['shape'][0]
     print("n_obs_steps: ", n_obs_steps)
     print("steps_per_inference:", steps_per_inference)
     print("action_offset:", action_offset)
+    print("action_dim:", action_dim)
+
+    # home position for both arms (7 joints), used only when --init_joints is set
+    home_joints = np.array([0.0, np.pi/3, np.pi/6, np.pi/5, 0.0, 0.0, 0.0])
+    init_joints_pos = home_joints if init_joints else None
 
     with SharedMemoryManager() as shm_manager:
-        with Spacemouse(shm_manager=shm_manager) as sm, RealEnv(
-            output_dir=output, 
-            robot_ip=robot_ip, 
-            frequency=frequency,
-            n_obs_steps=n_obs_steps,
-            obs_image_resolution=obs_res,
-            obs_float32=True,
-            init_joints=init_joints,
-            enable_multi_cam_vis=True,
-            record_raw_video=True,
-            # number of threads per camera view for video recording (H.264)
-            thread_per_video=3,
-            # video recording quality, lower is better (but slower).
-            video_crf=21,
-            shm_manager=shm_manager) as env:
+        # Build the leader (teleop input) and the follower (TrossenArmController),
+        # then hand the follower to RealEnv via robot=... so RealEnv does not try to
+        # create its own UR5 RTDE controller.
+        with LeaderArm(
+                shm_manager=shm_manager,
+                leader_ip=leader_ip,
+                frequency=100,
+                init_joints_pos=init_joints_pos,
+            ) as leader, \
+            TrossenArmController(
+                shm_manager=shm_manager,
+                follower_ip=follower_ip,
+                frequency=125,
+                init_joints_pos=init_joints_pos,
+            ) as robot, \
+            RealEnv(
+                output_dir=output, 
+                robot_ip=follower_ip,  # unused when robot= is provided
+                frequency=frequency,
+                n_obs_steps=n_obs_steps,
+                obs_image_resolution=obs_res,
+                obs_float32=True,
+                init_joints=init_joints,
+                enable_multi_cam_vis=True,
+                record_raw_video=True,
+                # number of threads per camera view for video recording (H.264)
+                thread_per_video=3,
+                # video recording quality, lower is better (but slower).
+                video_crf=21,
+                shm_manager=shm_manager,
+                robot=robot) as env:
             cv2.setNumThreads(1)
 
-            # Should be the same as demo
-            # realsense exposure
-            env.realsense.set_exposure(exposure=120, gain=0)
-            # realsense white balance
-            env.realsense.set_white_balance(white_balance=5900)
+            # Match data collection: demo_real_robot.py used auto exposure / white balance.
+            env.realsense.set_exposure()
+            env.realsense.set_white_balance()
 
             print("Waiting for realsense")
             time.sleep(1.0)
@@ -177,7 +200,7 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                     lambda x: torch.from_numpy(x).unsqueeze(0).to(device))
                 result = policy.predict_action(obs_dict)
                 action = result['action'][0].detach().to('cpu').numpy()
-                assert action.shape[-1] == 2
+                assert action.shape[-1] == action_dim
                 del result
 
             print('Ready!')
@@ -236,27 +259,10 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                         break
 
                     precise_wait(t_sample)
-                    # get teleop command
-                    sm_state = sm.get_motion_state_transformed()
-                    # print(sm_state)
-                    dpos = sm_state[:3] * (env.max_pos_speed / frequency)
-                    drot_xyz = sm_state[3:] * (env.max_rot_speed / frequency)
-  
-                    if not sm.is_button_pressed(0):
-                        # translation mode
-                        drot_xyz[:] = 0
-                    else:
-                        dpos[:] = 0
-                    if not sm.is_button_pressed(1):
-                        # 2D translation mode
-                        dpos[2] = 0    
-
-                    drot = st.Rotation.from_euler('xyz', drot_xyz)
-                    target_pose[:3] += dpos
-                    target_pose[3:] = (drot * st.Rotation.from_rotvec(
-                        target_pose[3:])).as_rotvec()
-                    # clip target pose
-                    target_pose[:2] = np.clip(target_pose[:2], [0.25, -0.45], [0.77, 0.40])
+                    # get teleop command from the leader arm (absolute 6-DOF pose).
+                    # The follower mirrors this pose, exactly like demo_real_robot.py.
+                    leader_state = leader.get_state()
+                    target_pose = np.array(leader_state['LeaderTCPPose'])
 
                     # execute teleop command
                     env.exec_actions(
@@ -279,8 +285,6 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                     precise_wait(eval_t_start - frame_latency, time_func=time.time)
                     print("Started!")
                     iter_idx = 0
-                    term_area_start_timestamp = float('inf')
-                    perv_target_pose = None
                     while True:
                         # calculate timing
                         t_cycle_end = t_start + (iter_idx + steps_per_inference) * dt
@@ -303,19 +307,9 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                             action = result['action'][0].detach().to('cpu').numpy()
                             print('Inference latency:', time.time() - s)
                         
-                        # convert policy action to env actions
-                        if delta_action:
-                            assert len(action) == 1
-                            if perv_target_pose is None:
-                                perv_target_pose = obs['robot_eef_pose'][-1]
-                            this_target_pose = perv_target_pose.copy()
-                            this_target_pose[[0,1]] += action[-1]
-                            perv_target_pose = this_target_pose
-                            this_target_poses = np.expand_dims(this_target_pose, axis=0)
-                        else:
-                            this_target_poses = np.zeros((len(action), len(target_pose)), dtype=np.float64)
-                            this_target_poses[:] = target_pose
-                            this_target_poses[:,[0,1]] = action
+                        # convert policy action to env actions.
+                        # TODO(abhi): delta actions
+                        this_target_poses = action.astype(np.float64)
 
                         # deal with timing
                         # the same step actions are always the target for
@@ -335,10 +329,6 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                         else:
                             this_target_poses = this_target_poses[is_new]
                             action_timestamps = action_timestamps[is_new]
-
-                        # clip actions
-                        this_target_poses[:,:2] = np.clip(
-                            this_target_poses[:,:2], [0.25, -0.45], [0.77, 0.40])
 
                         # execute actions
                         env.exec_actions(
@@ -373,28 +363,11 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                             print('Stopped.')
                             break
 
-                        # auto termination
+                        # auto termination (timeout only).
                         terminate = False
                         if time.monotonic() - t_start > max_duration:
                             terminate = True
                             print('Terminated by the timeout!')
-
-                        term_pose = np.array([ 3.40948500e-01,  2.17721816e-01,  4.59076878e-02,  2.22014183e+00, -2.22184883e+00, -4.07186655e-04])
-                        curr_pose = obs['robot_eef_pose'][-1]
-                        dist = np.linalg.norm((curr_pose - term_pose)[:2], axis=-1)
-                        if dist < 0.03:
-                            # in termination area
-                            curr_timestamp = obs['timestamp'][-1]
-                            if term_area_start_timestamp > curr_timestamp:
-                                term_area_start_timestamp = curr_timestamp
-                            else:
-                                term_area_time = curr_timestamp - term_area_start_timestamp
-                                if term_area_time > 0.5:
-                                    terminate = True
-                                    print('Terminated by the policy!')
-                        else:
-                            # out of the area
-                            term_area_start_timestamp = float('inf')
 
                         if terminate:
                             env.end_episode()
