@@ -13,7 +13,6 @@ from diffusion_policy.common.pose_trajectory_interpolator import PoseTrajectoryI
 class Command(enum.Enum):
     STOP = 0
     SCHEDULE_WAYPOINT = 1  # used by policy at eval time; not used during data collection
-# TODO(abhi): why were we using SERVOL = 1 in rtde_controller?
 class TrossenArmController(mp.Process):
     def __init__(self, 
                  shm_manager: SharedMemoryManager, 
@@ -70,7 +69,6 @@ class TrossenArmController(mp.Process):
         #   ActualQd       → robot_joint_vel   (follower joint velocities)
         # receive_keys is kept for future use but not needed for building the example.
 
-            # TODO(abhi): understand this as well seems some thing can be removed
         example = {
             # follower state — observations
             'ActualTCPPose':  np.zeros((6,), dtype=np.float64),  # follower EEF [x,y,z,rx,ry,rz]
@@ -129,7 +127,6 @@ class TrossenArmController(mp.Process):
         self.stop()
         
     # ========= command methods ============
-    # TODO(abhi): why remove servoL method? what was it doing?
     def schedule_waypoint(self, pose, target_time):
         """Called by env.exec_actions() at eval time to send policy-predicted targets."""
         assert target_time > time.time()
@@ -241,7 +238,6 @@ class TrossenArmController(mp.Process):
                         keep_running = False
                         # stop immediately, ignore later commands
                         break
-                    # TODO(abhi): why have we remove servol what was it doing check
                     elif cmd == Command.SCHEDULE_WAYPOINT.value:
                         target_pose = command['target_pose']
                         target_time = float(command['target_time'])
