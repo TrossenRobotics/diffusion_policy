@@ -143,13 +143,15 @@ def main(output, follower_ip, leader_ip, vis_camera_idx, init_joints, frequency,
 
                 precise_wait(t_sample)
                 # get teleop command from leader arm
-                # leader pose is already absolute
+                # action = 6D EEF pose + 1D gripper width (meters) = 7D
                 leader_state = leader.get_state()
                 target_pose = np.array(leader_state['LeaderTCPPose'])
+                gripper_width = float(leader_state['LeaderGripperPos'])
+                target_action = np.append(target_pose, gripper_width)
 
                 # execute teleop command
                 env.exec_actions(
-                    actions=[target_pose], 
+                    actions=[target_action],
                     timestamps=[t_command_target-time.monotonic()+time.time()],
                     stages=[stage])
                 precise_wait(t_cycle_end)

@@ -23,6 +23,8 @@ DEFAULT_OBS_KEY_MAP = {
     'ActualTCPSpeed': 'robot_eef_pose_vel',
     'ActualQ': 'robot_joint',
     'ActualQd': 'robot_joint_vel',
+    # gripper
+    'gripper_position': 'robot_gripper_width',
     # timestamps
     'step_idx': 'step_idx',
     'timestamp': 'timestamp'
@@ -333,11 +335,18 @@ class RealEnv:
         new_stages = stages[is_new]
 
         # schedule waypoints
+        # Actions are 6D (pose only) or 7D (pose + gripper width).
+        action_dim = new_actions.shape[-1]
         for i in range(len(new_actions)):
             self.robot.schedule_waypoint(
-                pose=new_actions[i],
+                pose=new_actions[i, :6],
                 target_time=new_timestamps[i]
             )
+            if action_dim > 6 and hasattr(self.robot, 'schedule_gripper'):
+                self.robot.schedule_gripper(
+                    pos=float(new_actions[i, 6]),
+                    target_time=new_timestamps[i]
+                )
         
         # record actions
         if self.action_accumulator is not None:

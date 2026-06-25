@@ -259,14 +259,16 @@ def main(input, output, follower_ip, leader_ip, match_dataset, match_episode,
                         break
 
                     precise_wait(t_sample)
-                    # get teleop command from the leader arm (absolute 6-DOF pose).
-                    # The follower mirrors this pose, exactly like demo_real_robot.py.
+                    # get teleop command from leader arm
+                    # action = 6D EEF pose + 1D gripper width = 7D
                     leader_state = leader.get_state()
                     target_pose = np.array(leader_state['LeaderTCPPose'])
+                    gripper_width = float(leader_state['LeaderGripperPos'])
+                    target_action = np.append(target_pose, gripper_width)
 
                     # execute teleop command
                     env.exec_actions(
-                        actions=[target_pose], 
+                        actions=[target_action],
                         timestamps=[t_command_target-time.monotonic()+time.time()])
                     precise_wait(t_cycle_end)
                     iter_idx += 1

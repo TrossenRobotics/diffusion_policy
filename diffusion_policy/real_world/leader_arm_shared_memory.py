@@ -8,8 +8,8 @@ from diffusion_policy.shared_memory.shared_memory_ring_buffer import SharedMemor
 
 class LeaderArm(mp.Process):
     """
-    Continuously reads the leader arm's Cartesian and publishes it to a 
-    shared memory ring buffer.
+    Continuously reads the leader arm's Cartesian pose (and gripper width) and
+    publishes it to a shared memory ring buffer.
 
     The leader arm is set to external_effort mode with zero efforts (gravity
     compensation) so it can be moved freely.
@@ -27,7 +27,7 @@ class LeaderArm(mp.Process):
         frequency:  polling rate in Hz — how often leader state is read and published
         get_max_k:  maximum number of past readings the main loop can request at once
         """
-        super().__init__()
+        super().__init__(name="LeaderArm")
 
         self.leader_ip = leader_ip
         self.frequency = frequency
@@ -38,8 +38,10 @@ class LeaderArm(mp.Process):
 
         example = {
             # Cartesian EEF pose of the leader: [x, y, z, rx, ry, rz]
-            # in metres and radians (angle-axis), same convention as UR5 ActualTCPPose
+            # in meters and radians (angle-axis), same convention as UR5 ActualTCPPose
             'LeaderTCPPose': np.zeros((6,), dtype=np.float64),
+            # leader gripper width in meters (same convention as the follower / WSG)
+            'LeaderGripperPos': 0.0,
             'receive_timestamp': time.time(),
         }
         ring_buffer = SharedMemoryRingBuffer.create_from_examples(
@@ -58,10 +60,9 @@ class LeaderArm(mp.Process):
 
     def get_state(self):
         """
-        Return the latest leader arm snapshot.
-        reads the single most recent ring buffer entry.
+        Return the latest leader arm snapshot (single most recent ring buffer entry).
 
-        Returns dict with keys: LeaderTCPPose (6,), receive_timestamp.
+        Returns dict with keys: LeaderTCPPose (6,), LeaderGripperPos, receive_timestamp.
         """
         return self.ring_buffer.get()
 
@@ -76,6 +77,10 @@ class LeaderArm(mp.Process):
         self.stop_event.set()
         if wait:
             self.join()
+
+    @property
+    def is_ready(self):
+        return self.ready_event.is_set()
 
     def __enter__(self):
         self.start()
@@ -113,7 +118,8 @@ class LeaderArm(mp.Process):
             # publish one reading immediately so the main loop can start reading
             # without waiting for the first sleep cycle (mirrors Spacemouse.run())
             self.ring_buffer.put({
-                'LeaderTCPPose':    np.array(driver.get_cartesian_positions()),
+                'LeaderTCPPose':     np.array(driver.get_cartesian_positions()),
+                'LeaderGripperPos':  driver.get_gripper_position(),
                 'receive_timestamp': time.time(),
             })
             self.ready_event.set()
@@ -124,7 +130,8 @@ class LeaderArm(mp.Process):
 
                 # overwrite with latest hardware reading (not accumulate — same as SpaceMouse)
                 self.ring_buffer.put({
-                    'LeaderTCPPose':    np.array(driver.get_cartesian_positions()),
+                    'LeaderTCPPose':     np.array(driver.get_cartesian_positions()),
+                    'LeaderGripperPos':  driver.get_gripper_position(),
                     'receive_timestamp': time.time(),
                 })
 
@@ -143,3 +150,5 @@ class LeaderArm(mp.Process):
             except Exception:
                 pass
             driver.cleanup()
+
+            self.ready_event.set()

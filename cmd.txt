@@ -1,0 +1,21 @@
+# Data collection
+
+uv run python -u demo_real_robot.py -o data/trossen_cleaning_real \
+  --follower_ip 192.168.1.4 --leader_ip 192.168.1.2 --frequency 10
+
+------
+# Training
+uv run python train.py --config-name=train_diffusion_unet_real_hybrid_workspace \
+  task=trossen_push_cube_image logging.mode=offline
+
+uv run python train.py --config-name=train_diffusion_unet_real_hybrid_workspace \
+  task=trossen_cleaning task.dataset_path=data/cleaning_real logging.mode=offline
+
+------
+# evaluation
+uv run python eval_real_robot.py \
+  -i data/outputs/2026.06.25/17.28.30_train_diffusion_unet_hybrid_trossen_cleaning/checkpoints/epoch=0000-train_loss=1.225.ckpt \
+  -o data/eval_cleaning_smoke \
+  --follower_ip 192.168.1.4 \
+  --leader_ip 192.168.1.2 \
+  --frequency 10
