@@ -199,6 +199,7 @@ class RealEnv:
         self.obs_accumulator = None
         self.action_accumulator = None
         self.stage_accumulator = None
+        self._paused_accumulators = None
 
         self.start_time = None
     
@@ -437,6 +438,26 @@ class RealEnv:
             self.obs_accumulator = None
             self.action_accumulator = None
             self.stage_accumulator = None
+
+    def pause_recording(self):
+        """
+        DAgger: freeze obs/action accumulation without stopping the episode, so the
+        leader-sync window isn't recorded as a demonstrated action. get_obs() can still
+        be called for visualization while paused; just don't call exec_actions().
+        """
+        assert self.obs_accumulator is not None, "No episode in progress to pause"
+        self._paused_accumulators = (
+            self.obs_accumulator, self.action_accumulator, self.stage_accumulator)
+        self.obs_accumulator = None
+        self.action_accumulator = None
+        self.stage_accumulator = None
+
+    def resume_recording(self):
+        "Resume accumulation into the same episode after pause_recording()"
+        assert self._paused_accumulators is not None, "Not paused"
+        self.obs_accumulator, self.action_accumulator, self.stage_accumulator = \
+            self._paused_accumulators
+        self._paused_accumulators = None
 
     def drop_episode(self):
         self.end_episode()

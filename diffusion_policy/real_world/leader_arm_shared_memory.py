@@ -1,9 +1,16 @@
+import enum
 import time
 import multiprocessing as mp
 from multiprocessing.managers import SharedMemoryManager
 import numpy as np
 import trossen_arm
+from diffusion_policy.shared_memory.shared_memory_queue import (
+    SharedMemoryQueue, Empty)
 from diffusion_policy.shared_memory.shared_memory_ring_buffer import SharedMemoryRingBuffer
+
+
+class Command(enum.Enum):
+    MOVE_TO_POSE = 0  # DAgger: drive the leader to a target pose+gripper, then back to gravity comp
 
 
 class LeaderArm(mp.Process):
@@ -12,7 +19,10 @@ class LeaderArm(mp.Process):
     publishes it to a shared memory ring buffer.
 
     The leader arm is set to external_effort mode with zero efforts (gravity
-    compensation) so it can be moved freely.
+    compensation) so it can be moved freely. It also accepts a one-shot
+    MOVE_TO_POSE command (used by the DAgger intervention flow in
+    eval_real_robot.py) that briefly switches to position mode to drive the
+    leader to a specific pose, then returns to gravity compensation.
     """
 
     def __init__(self,
@@ -52,9 +62,24 @@ class LeaderArm(mp.Process):
             put_desired_frequency=frequency
         )
 
+        # command channel for one-shot MOVE_TO_POSE requests (DAgger sync)
+        input_example = {
+            'cmd': Command.MOVE_TO_POSE.value,
+            'target_pose': np.zeros((6,), dtype=np.float64),
+            'target_gripper': 0.0,
+            'duration': 0.0,
+        }
+        input_queue = SharedMemoryQueue.create_from_examples(
+            shm_manager=shm_manager,
+            examples=input_example,
+            buffer_size=16
+        )
+
         self.ready_event = mp.Event()
         self.stop_event = mp.Event()
+        self.sync_done_event = mp.Event()
         self.ring_buffer = ring_buffer
+        self.input_queue = input_queue
 
     # ======= get state APIs ==========
 
@@ -65,6 +90,26 @@ class LeaderArm(mp.Process):
         Returns dict with keys: LeaderTCPPose (6,), LeaderGripperPos, receive_timestamp.
         """
         return self.ring_buffer.get()
+
+    # ======= command APIs ==========
+
+    def move_to_pose(self, target_pose, target_gripper, duration=5.0, wait=True, timeout=None):
+        """
+        DAgger sync: drive the leader (position mode) to target_pose/target_gripper over
+        `duration` seconds, then switch it back to gravity-comp so a human can take over.
+        Blocks until done (or `timeout`, default duration + 2.0s) if wait=True.
+        """
+        self.sync_done_event.clear()
+        self.input_queue.put({
+            'cmd': Command.MOVE_TO_POSE.value,
+            'target_pose': np.array(target_pose, dtype=np.float64),
+            'target_gripper': float(target_gripper),
+            'duration': float(duration),
+        })
+        if wait:
+            if timeout is None:
+                timeout = duration + 2.0
+            self.sync_done_event.wait(timeout)
 
     # ========== start / stop API ===========
 
@@ -134,6 +179,32 @@ class LeaderArm(mp.Process):
                     'LeaderGripperPos':  driver.get_gripper_position(),
                     'receive_timestamp': time.time(),
                 })
+
+                # handle DAgger sync commands
+                try:
+                    commands = self.input_queue.get_all()
+                    n_cmd = len(commands['cmd'])
+                except Empty:
+                    n_cmd = 0
+
+                for i in range(n_cmd):
+                    cmd = commands['cmd'][i]
+                    if cmd == Command.MOVE_TO_POSE.value:
+                        target_pose = commands['target_pose'][i]
+                        target_gripper = float(commands['target_gripper'][i])
+                        duration = float(commands['duration'][i])
+                        print(f"[LeaderArm] Syncing to follower pose over {duration:.1f}s")
+                        driver.set_all_modes(trossen_arm.Mode.position)
+                        driver.set_cartesian_positions(
+                            target_pose, trossen_arm.InterpolationSpace.cartesian,
+                            duration, False)
+                        driver.set_gripper_position(target_gripper, duration, False)
+                        time.sleep(duration)
+                        driver.set_all_modes(trossen_arm.Mode.external_effort)
+                        driver.set_all_external_efforts(
+                            np.zeros(driver.get_num_joints()), 0.0, False)
+                        self.sync_done_event.set()
+                        print("[LeaderArm] Sync done, back in gravity comp")
 
                 elapsed = time.perf_counter() - t_start
                 time.sleep(max(0, dt - elapsed))

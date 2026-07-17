@@ -14,24 +14,35 @@ Press "C" to start evaluation (hand control over to policy).
 Press "Q" to exit program.
 
 ================ Policy in control ==============
-Make sure you can hit the robot hardware emergency-stop button quickly! 
+Make sure you can hit the robot hardware emergency-stop button quickly!
 
 Recording control:
 Press "S" to stop evaluation and gain control back.
+Press "I" to intervene (DAgger). Two modes, set via --dagger_mode:
+  absolute (default): pauses recording, leader arm auto-syncs to the follower's current
+    pose (do not touch either arm while this happens), then hands teleop control to you.
+  relative: no pause, no leader movement -- teleop resumes immediately using a fixed
+    offset from the leader's live pose (clutch-style).
+Either way, press "S" when done to save the whole episode (policy portion + your
+recovery) into the DAgger dataset directory.
 """
 
 # %%
 import time
+import json
+import shutil
 from multiprocessing.managers import SharedMemoryManager
 import click
 import cv2
 import numpy as np
+import scipy.spatial.transform as st
 import torch
 import dill
 import hydra
 import pathlib
 import skvideo.io
 from omegaconf import OmegaConf
+from diffusion_policy.common.replay_buffer import ReplayBuffer
 from diffusion_policy.real_world.real_env import RealEnv
 # Trossen teleop (leader) + follower controller replace the UR5 SpaceMouse setup.
 from diffusion_policy.real_world.leader_arm_shared_memory import LeaderArm
@@ -48,6 +59,26 @@ from diffusion_policy.common.cv2_util import get_image_transform
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
+# matches TrossenArmController's default; used to clip the relative-mode gripper target.
+GRIPPER_MAX_WIDTH = 0.044
+
+
+def pose_to_mat(pose):
+    "[x,y,z,rx,ry,rz] (angle-axis) -> 4x4 SE(3) matrix"
+    mat = np.eye(4)
+    mat[:3, 3] = pose[:3]
+    mat[:3, :3] = st.Rotation.from_rotvec(pose[3:6]).as_matrix()
+    return mat
+
+
+def mat_to_pose(mat):
+    "4x4 SE(3) matrix -> [x,y,z,rx,ry,rz] (angle-axis)"
+    pose = np.zeros(6)
+    pose[:3] = mat[:3, 3]
+    pose[3:6] = st.Rotation.from_matrix(mat[:3, :3]).as_rotvec()
+    return pose
+
+
 @click.command()
 @click.option('--input', '-i', required=True, help='Path to checkpoint')
 @click.option('--output', '-o', required=True, help='Directory to save recording')
@@ -61,10 +92,19 @@ OmegaConf.register_new_resolver("eval", eval, replace=True)
 @click.option('--max_duration', '-md', default=60, help='Max duration for each epoch in seconds.')
 @click.option('--frequency', '-f', default=10, type=float, help="Control frequency in Hz.")
 @click.option('--command_latency', '-cl', default=0.01, type=float, help="Latency between receiving SapceMouse command to executing on Robot in Sec.")
+@click.option('--dagger_output', '-do', default=None, help="Directory to save DAgger intervention episodes. Defaults to '<output>_dagger'.")
+@click.option('--dagger_sync_duration', '-dsd', default=5.0, type=float, help="Seconds for the leader arm to auto-sync to the follower's pose during an intervention. Only used in --dagger_mode=absolute.")
+@click.option('--dagger_mode', '-dm', default='absolute', type=click.Choice(['absolute', 'relative']),
+    help="absolute: leader physically syncs to the follower's pose (pauses recording, ~dagger_sync_duration). "
+         "relative: no leader movement or pause -- a fixed offset is computed once at intervention time and "
+         "composed onto the leader's live pose (clutch-style), so teleop resumes immediately.")
 def main(input, output, follower_ip, leader_ip, match_dataset, match_episode,
-    vis_camera_idx, init_joints, 
+    vis_camera_idx, init_joints,
     steps_per_inference, max_duration,
-    frequency, command_latency):
+    frequency, command_latency,
+    dagger_output, dagger_sync_duration, dagger_mode):
+    if dagger_output is None:
+        dagger_output = f'{output.rstrip("/")}_dagger'
     # load match_dataset
     match_camera_idx = 0
     episode_first_frame_map = dict()
@@ -148,6 +188,15 @@ def main(input, output, follower_ip, leader_ip, match_dataset, match_episode,
     # home position for both arms (7 joints), used only when --init_joints is set
     home_joints = np.array([0.0, np.pi/3, np.pi/6, np.pi/5, 0.0, 0.0, 0.0])
     init_joints_pos = home_joints if init_joints else None
+
+    # DAgger dataset: episodes with a mid-episode intervention are routed here instead
+    # of the regular eval output dir. Just a second Zarr store + video dir, no hardware.
+    dagger_output_dir = pathlib.Path(dagger_output)
+    dagger_video_dir = dagger_output_dir.joinpath('videos')
+    dagger_video_dir.mkdir(parents=True, exist_ok=True)
+    dagger_zarr_path = str(dagger_output_dir.joinpath('replay_buffer.zarr').absolute())
+    dagger_replay_buffer = ReplayBuffer.create_from_path(zarr_path=dagger_zarr_path, mode='a')
+    print(f"DAgger episodes will be saved to {dagger_output_dir}")
 
     with SharedMemoryManager() as shm_manager:
         # Build the leader (teleop input) and the follower (TrossenArmController),
@@ -274,6 +323,7 @@ def main(input, output, follower_ip, leader_ip, match_dataset, match_episode,
                     iter_idx += 1
                 
                 # ========== policy control loop ==============
+                intervened = False
                 try:
                     # start episode
                     policy.reset()
@@ -281,6 +331,10 @@ def main(input, output, follower_ip, leader_ip, match_dataset, match_episode,
                     eval_t_start = time.time() + start_delay
                     t_start = time.monotonic() + start_delay
                     env.start_episode(eval_t_start)
+                    # index start_episode() used for this episode's video dir; captured now
+                    # because pop_episode() (used if we later route this to DAgger) removes
+                    # it from replay_buffer.n_episodes.
+                    episode_id_at_start = env.replay_buffer.n_episodes
                     # wait for 1/30 sec to get the closest frame actually
                     # reduces overall latency
                     frame_latency = 1/30
@@ -364,6 +418,106 @@ def main(input, output, follower_ip, leader_ip, match_dataset, match_episode,
                             env.end_episode()
                             print('Stopped.')
                             break
+                        elif key_stroke == ord('i'):
+                            # ===== DAgger intervention =====
+                            intervened = True
+                            sync_row_start = None
+                            sync_row_end = None
+                            offset_mat = None
+                            gripper_offset = None
+
+                            if dagger_mode == 'absolute':
+                                # exact row index the episode's low-dim data is at right
+                                # now. Everything from this row up to sync_row_end (set
+                                # below) is the leader-sync pause window, trimmed
+                                # afterward by trim_dagger_sync.py.
+                                sync_row_start = len(env.obs_accumulator)
+                                print('Intervening! Pausing recording, leader syncing to follower pose...')
+                                env.pause_recording()
+
+                                # freeze target: exactly where the follower currently is
+                                follower_state = env.get_robot_state()
+                                sync_pose = np.array(follower_state['ActualTCPPose'])
+                                sync_gripper = float(np.array(follower_state['gripper_position']).reshape(-1)[0])
+
+                                sync_vis = env.get_obs()[f'camera_{vis_camera_idx}'][-1].copy()
+                                cv2.putText(sync_vis, 'SYNCING - do not touch either arm',
+                                    (10,20), fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+                                    fontScale=0.5, thickness=1, color=(0,0,255))
+                                cv2.imshow('default', sync_vis[...,::-1])
+                                cv2.waitKey(1)
+
+                                leader.move_to_pose(sync_pose, sync_gripper,
+                                    duration=dagger_sync_duration, wait=True)
+                                env.resume_recording()
+                            else:
+                                # relative (clutch): no leader movement, no pause -- a
+                                # fixed offset is computed once from the leader/follower's
+                                # CURRENT poses, then applied to the leader's live pose
+                                # every step from here on (see CLAUDE.md DAgger section).
+                                print('Intervening! Clutching in, teleop resumes immediately (no sync pause).')
+                                leader_state = leader.get_state()
+                                follower_state = env.get_robot_state()
+                                leader_pose0 = np.array(leader_state['LeaderTCPPose'])
+                                leader_gripper0 = float(leader_state['LeaderGripperPos'])
+                                follower_pose0 = np.array(follower_state['ActualTCPPose'])
+                                follower_gripper0 = float(np.array(follower_state['gripper_position']).reshape(-1)[0])
+                                offset_mat = np.linalg.inv(pose_to_mat(leader_pose0)) @ pose_to_mat(follower_pose0)
+                                gripper_offset = follower_gripper0 - leader_gripper0
+
+                            print('Teleop control! Move the leader arm. Press S to end episode.')
+
+                            # ===== DAgger recovery teleop (same episode, still recording) =====
+                            t_start_dagger = time.monotonic()
+                            iter_idx_dagger = 0
+                            while True:
+                                t_cycle_end_dagger = t_start_dagger + (iter_idx_dagger + 1) * dt
+                                t_sample_dagger = t_cycle_end_dagger - command_latency
+                                t_command_target_dagger = t_cycle_end_dagger + dt
+
+                                dagger_obs = env.get_obs()
+                                if dagger_mode == 'absolute' and sync_row_end is None:
+                                    # this first post-resume get_obs() is exactly where the
+                                    # accumulator catches its internal clock up to real time
+                                    # in one shot -- read the row index right after it happens.
+                                    sync_row_end = len(env.obs_accumulator)
+                                dagger_vis = dagger_obs[f'camera_{vis_camera_idx}'][-1].copy()
+                                cv2.putText(dagger_vis, 'DAgger recovery - Press S to end episode',
+                                    (10,20), fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+                                    fontScale=0.5, thickness=1, color=(255,255,255))
+                                cv2.imshow('default', dagger_vis[...,::-1])
+
+                                key_stroke_dagger = cv2.pollKey()
+                                if key_stroke_dagger == ord('s'):
+                                    env.end_episode()
+                                    print('Stopped.')
+                                    break
+
+                                precise_wait(t_sample_dagger)
+                                leader_state = leader.get_state()
+                                if dagger_mode == 'absolute':
+                                    dagger_target_pose = np.array(leader_state['LeaderTCPPose'])
+                                    dagger_gripper_width = float(leader_state['LeaderGripperPos'])
+                                else:
+                                    leader_pose_now = np.array(leader_state['LeaderTCPPose'])
+                                    leader_gripper_now = float(leader_state['LeaderGripperPos'])
+                                    dagger_target_pose = mat_to_pose(pose_to_mat(leader_pose_now) @ offset_mat)
+                                    dagger_gripper_width = float(np.clip(
+                                        leader_gripper_now + gripper_offset, 0.0, GRIPPER_MAX_WIDTH))
+                                # only append gripper for tasks trained with a 7D
+                                # (pose+gripper) action space -- matches how
+                                # RealEnv.exec_actions() itself gates gripper scheduling.
+                                if action_dim > 6:
+                                    dagger_target_action = np.append(dagger_target_pose, dagger_gripper_width)
+                                else:
+                                    dagger_target_action = dagger_target_pose
+
+                                env.exec_actions(
+                                    actions=[dagger_target_action],
+                                    timestamps=[t_command_target_dagger - time.monotonic() + time.time()])
+                                precise_wait(t_cycle_end_dagger)
+                                iter_idx_dagger += 1
+                            break
 
                         # auto termination (timeout only).
                         terminate = False
@@ -383,8 +537,32 @@ def main(input, output, follower_ip, leader_ip, match_dataset, match_episode,
                     print("Interrupted!")
                     # stop robot.
                     env.end_episode()
-                
+
                 print("Stopped.")
+
+                if intervened:
+                    # route the whole episode (policy portion + human recovery) into the
+                    # DAgger dataset instead of the regular eval output.
+                    episode = env.replay_buffer.pop_episode()
+                    dagger_replay_buffer.add_episode(episode, compressors='disk')
+                    dagger_episode_id = dagger_replay_buffer.n_episodes - 1
+                    src_video_dir = env.video_dir.joinpath(str(episode_id_at_start))
+
+                    # record the exact sync-pause row range measured live, so
+                    # trim_dagger_sync.py can cut precisely instead of guessing from data.
+                    if sync_row_end is not None:
+                        sync_info = {
+                            'start_idx': sync_row_start,
+                            'end_idx': sync_row_end,
+                            'dt': dt,
+                        }
+                        if src_video_dir.exists():
+                            (src_video_dir / 'sync_window.json').write_text(json.dumps(sync_info))
+
+                    dst_video_dir = dagger_video_dir.joinpath(str(dagger_episode_id))
+                    if src_video_dir.exists():
+                        shutil.move(str(src_video_dir), str(dst_video_dir))
+                    print(f'Routed episode to DAgger dataset as episode {dagger_episode_id}: {dagger_output_dir}')
 
 
 
