@@ -3,6 +3,7 @@ import time
 import multiprocessing as mp
 from multiprocessing.managers import SharedMemoryManager
 import numpy as np
+import scipy.spatial.transform as st
 import trossen_arm
 from diffusion_policy.shared_memory.shared_memory_queue import (
     SharedMemoryQueue, Empty)
@@ -11,6 +12,51 @@ from diffusion_policy.shared_memory.shared_memory_ring_buffer import SharedMemor
 
 class Command(enum.Enum):
     MOVE_TO_POSE = 0  # DAgger: drive the leader to a target pose+gripper, then back to gravity comp
+
+
+# Glide leader correction
+_GLIDE_RIGHT_JOINT_ORIGINS = np.array([
+    [0.0, 0.0, 0.05725],
+    [0.02, 0.0, 0.04625],
+    [-0.264, 0.0, 0.0],
+    [0.245, 0.0, 0.06],
+    [0.06775, 0.0, 0.0455],
+    [0.02895, 0.0, -0.0455],
+])
+_GLIDE_RIGHT_JOINT_AXES = np.array([
+    [0.0, 0.0, 1.0],
+    [0.0, 1.0, 0.0],
+    [0.0, -1.0, 0.0],
+    [0.0, -1.0, 0.0],
+    [0.0, 0.0, -1.0],
+    [1.0, 0.0, 0.0],
+])
+_GLIDE_RIGHT_EE_OFFSET = np.array([0.156062, 0.0, 0.0])
+
+
+def _glide_right_cartesian_pose(joint_positions):
+    """
+    Raw arm-joint positions (first 6 of get_all_positions()) from a glide_right leader
+    -> corrected Cartesian [x,y,z,rx,ry,rz], matching the wxai_v0/follower convention.
+    """
+    q = np.array(joint_positions[:6], dtype=np.float64)
+    q[3] = -q[3]
+    q[4] = -q[4]
+    q[5] = q[5] + np.pi / 4.0
+
+    pose = np.eye(4)
+    for origin_xyz, axis, angle in zip(_GLIDE_RIGHT_JOINT_ORIGINS, _GLIDE_RIGHT_JOINT_AXES, q):
+        t = np.eye(4)
+        t[:3, 3] = origin_xyz
+        r = np.eye(4)
+        r[:3, :3] = st.Rotation.from_rotvec(axis * angle).as_matrix()
+        pose = pose @ t @ r
+    pose[:3, 3] += pose[:3, :3] @ _GLIDE_RIGHT_EE_OFFSET
+
+    result = np.zeros(6)
+    result[:3] = pose[:3, 3]
+    result[3:] = st.Rotation.from_matrix(pose[:3, :3]).as_rotvec()
+    return result
 
 
 class LeaderArm(mp.Process):
@@ -31,16 +77,20 @@ class LeaderArm(mp.Process):
             frequency: int = 100,
             get_max_k: int = 30,
             init_joints_pos=None,
+            is_glide: bool = False,
             ):
         """
         leader_ip:  IP address of the leader arm controller
         frequency:  polling rate in Hz — how often leader state is read and published
         get_max_k:  maximum number of past readings the main loop can request at once
+        is_glide:   True if the leader hardware is a Glide arm (unactuated, position-
+                    read-only) instead of a normal actuated WXAI-v0 leader arm.
         """
         super().__init__(name="LeaderArm")
 
         self.leader_ip = leader_ip
         self.frequency = frequency
+        self.is_glide = is_glide
         if init_joints_pos is not None:
             init_joints_pos = np.array(init_joints_pos)
             assert init_joints_pos.shape == (7,)
@@ -138,8 +188,9 @@ class LeaderArm(mp.Process):
 
     def run(self):
         driver = trossen_arm.TrossenArmDriver()
+        leader_model = trossen_arm.Model.glide_right if self.is_glide else trossen_arm.Model.wxai_v0
         driver.configure(
-            trossen_arm.Model.wxai_v0,
+            leader_model,
             trossen_arm.StandardEndEffector.wxai_v0_leader,
             self.leader_ip,
             False
@@ -160,10 +211,15 @@ class LeaderArm(mp.Process):
                 False
             )
 
+            def get_leader_pose():
+                if self.is_glide:
+                    return _glide_right_cartesian_pose(driver.get_all_positions())
+                return np.array(driver.get_cartesian_positions())
+
             # publish one reading immediately so the main loop can start reading
             # without waiting for the first sleep cycle (mirrors Spacemouse.run())
             self.ring_buffer.put({
-                'LeaderTCPPose':     np.array(driver.get_cartesian_positions()),
+                'LeaderTCPPose':     get_leader_pose(),
                 'LeaderGripperPos':  driver.get_gripper_position(),
                 'receive_timestamp': time.time(),
             })
@@ -175,7 +231,7 @@ class LeaderArm(mp.Process):
 
                 # overwrite with latest hardware reading (not accumulate — same as SpaceMouse)
                 self.ring_buffer.put({
-                    'LeaderTCPPose':     np.array(driver.get_cartesian_positions()),
+                    'LeaderTCPPose':     get_leader_pose(),
                     'LeaderGripperPos':  driver.get_gripper_position(),
                     'receive_timestamp': time.time(),
                 })

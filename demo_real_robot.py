@@ -35,7 +35,8 @@ from diffusion_policy.real_world.keystroke_counter import (
 @click.option('--init_joints', '-j', is_flag=True, default=False, help="Whether to initialize robots joint configuration in the beginning.")
 @click.option('--frequency', '-f', default=10, type=float, help="Control frequency in Hz.")
 @click.option('--command_latency', '-cl', default=0.01, type=float, help="Latency between reading leader pose and executing on follower in Sec.")
-def main(output, follower_ip, leader_ip, vis_camera_idx, init_joints, frequency, command_latency):
+@click.option('--leader_glide', '-lg', is_flag=True, default=False, help="Set if the leader hardware is an unactuated Glide arm instead of a normal WXAI-v0 leader arm.")
+def main(output, follower_ip, leader_ip, vis_camera_idx, init_joints, frequency, command_latency, leader_glide):
     dt = 1/frequency
     # home position — both arms start here before teleoperation
     home_joints = np.array([0.0, np.pi/3, np.pi/6, np.pi/5, 0.0, 0.0, 0.0])
@@ -48,6 +49,7 @@ def main(output, follower_ip, leader_ip, vis_camera_idx, init_joints, frequency,
                 leader_ip=leader_ip,
                 frequency=100,
                 init_joints_pos=init_joints_pos,
+                is_glide=leader_glide,
             ) as leader, \
             TrossenArmController(
                 shm_manager=shm_manager,

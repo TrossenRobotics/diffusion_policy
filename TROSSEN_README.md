@@ -12,6 +12,9 @@ git checkout create_pyproject
 uv sync
 ```
 
+> If `uv sync` fails with a `cmake_minimum_required`/"Compatibility with CMake < 3.5"
+> error, run `CMAKE_POLICY_VERSION_MINIMUM=3.5 uv sync` instead.
+
 ## 1. Collect demonstrations
 
 Teleoperate the follower with the leader arm and record episodes.

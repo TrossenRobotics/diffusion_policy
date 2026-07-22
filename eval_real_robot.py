@@ -98,11 +98,12 @@ def mat_to_pose(mat):
     help="absolute: leader physically syncs to the follower's pose (pauses recording, ~dagger_sync_duration). "
          "relative: no leader movement or pause -- a fixed offset is computed once at intervention time and "
          "composed onto the leader's live pose (clutch-style), so teleop resumes immediately.")
+@click.option('--leader_glide', '-lg', is_flag=True, default=False, help="Set if the leader hardware is an unactuated Glide arm instead of a normal WXAI-v0 leader arm. Note: incompatible with --dagger_mode=absolute, which physically drives the leader.")
 def main(input, output, follower_ip, leader_ip, match_dataset, match_episode,
     vis_camera_idx, init_joints,
     steps_per_inference, max_duration,
     frequency, command_latency,
-    dagger_output, dagger_sync_duration, dagger_mode):
+    dagger_output, dagger_sync_duration, dagger_mode, leader_glide):
     if dagger_output is None:
         dagger_output = f'{output.rstrip("/")}_dagger'
     # load match_dataset
@@ -207,6 +208,7 @@ def main(input, output, follower_ip, leader_ip, match_dataset, match_episode,
                 leader_ip=leader_ip,
                 frequency=100,
                 init_joints_pos=init_joints_pos,
+                is_glide=leader_glide,
             ) as leader, \
             TrossenArmController(
                 shm_manager=shm_manager,
